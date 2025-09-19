@@ -1,82 +1,171 @@
-# Yape Code Challenge :rocket:
+# Yape Code Challenge — Node.js + TypeScript (Event-Driven • Clean Architecture)
 
-Our code challenge will let you marvel us with your Jedi coding skills :smile:. 
+Implementation aligned with the official challenge: **Transaction API** + **Anti-Fraud service** using **Kafka** (Redpanda).  
+Includes **domain validations**, **repository pattern**, **service layer**, **dependency injection**, **RFC7807 error responses**, **tests**, and **Docker Compose**.
 
-Don't forget that the proper way to submit your work is to fork the repo and create a PR :wink: ... have fun !!
+---
 
-- [Problem](#problem)
-- [Tech Stack](#tech_stack)
-- [Send us your challenge](#send_us_your_challenge)
+## Stack
 
-# Problem
+- **Node 20**, **TypeScript**
+- **Express** (Transaction API)
+- **KafkaJS** (producer/consumer) + **Redpanda** (Kafka compatible)
+- **Zod** (domain validation)
+- **Pino** (structured logging)
+- **Jest + ts-jest + Supertest** (unit & endpoint tests)
+- **Clean/Hexagonal** (ports & adapters), **DI container**, **in-memory repository** (swappable)
 
-Every time a financial transaction is created it must be validated by our anti-fraud microservice and then the same service sends a message back to update the transaction status.
-For now, we have only three transaction statuses:
+---
 
-<ol>
-  <li>pending</li>
-  <li>approved</li>
-  <li>rejected</li>  
-</ol>
+## Quick Start (Docker)
 
-Every transaction with a value greater than 1000 should be rejected.
+```bash
+docker compose up --build -d
 
-```mermaid
-  flowchart LR
-    Transaction -- Save Transaction with pending Status --> transactionDatabase[(Database)]
-    Transaction --Send transaction Created event--> Anti-Fraud
-    Anti-Fraud -- Send transaction Status Approved event--> Transaction
-    Anti-Fraud -- Send transaction Status Rejected event--> Transaction
-    Transaction -- Update transaction Status event--> transactionDatabase[(Database)]
+# Health check
+curl http://localhost:3000/api/v1/health
+# -> { "status": "ok" }
 ```
 
-# Tech Stack
+> Services:
+> - `transaction-service`: http://localhost:3000  
+> - `anti-fraud-service`: background consumer  
+> - `redpanda`: Kafka broker (internal)
 
-<ol>
-  <li>Node. You can use any framework you want (i.e. Nestjs with an ORM like TypeOrm or Prisma) </li>
-  <li>Any database</li>
-  <li>Kafka</li>    
-</ol>
+---
 
-We do provide a `Dockerfile` to help you get started with a dev environment.
+## API
 
-You must have two resources:
+### Create Transaction
+Approved when `value <= 1000`; Rejected when `value > 1000`.  
+Amounts are **integer cents**.
 
-1. Resource to create a transaction that must containt:
+**Request**
+```bash
+curl -X POST http://localhost:3000/api/v1/transactions   -H "Content-Type: application/json"   -H "Idempotency-Key: optional-key-123"   -d '{
+    "accountExternalIdDebit":"11111111-1111-4111-8111-111111111111",
+    "accountExternalIdCredit":"22222222-2222-4222-8222-222222222222",
+    "tranferTypeId": 1,
+    "value": 500
+  }'
+```
 
+**201 Created**
+```json
+{ "transactionExternalId": "xxxxxxxxxxxxxxx" }
+```
+
+The record starts as `"pending"`. The anti-fraud service consumes `transaction-created`,
+decides, and publishes `transaction-status` → API updates the status to `"approved"` or `"rejected"`.
+
+---
+
+### Get Transaction by ID
+```bash
+curl http://localhost:3000/api/v1/transactions/<transactionExternalId>
+```
+
+**200 OK (example)**
 ```json
 {
-  "accountExternalIdDebit": "Guid",
-  "accountExternalIdCredit": "Guid",
-  "tranferTypeId": 1,
-  "value": 120
+  "transactionExternalId": "<id>",
+  "transactionType": { "name": "1" },
+  "transactionStatus": { "name": "approved" },
+  "value": 500,
+  "createdAt": "2025-09-19T22:15:10.123Z"
 }
 ```
 
-2. Resource to retrieve a transaction
+---
+
+### Errors (RFC7807)
+- Content-Type: `application/problem+json`
+
+Examples:
+- **400 Validation Error** (invalid payload / schema)
+- **422 Domain Rule** (e.g., same debit/credit account)
+- **404 Not Found**
 
 ```json
 {
-  "transactionExternalId": "Guid",
-  "transactionType": {
-    "name": ""
-  },
-  "transactionStatus": {
-    "name": ""
-  },
-  "value": 120,
-  "createdAt": "Date"
+  "type": "https://zod.dev/validation-error",
+  "title": "Validation Error",
+  "status": 400,
+  "detail": [ /* issues */ ]
 }
 ```
 
-## Optional
+---
 
-You can use any approach to store transaction data but you should consider that we may deal with high volume scenarios where we have a huge amount of writes and reads for the same data at the same time. How would you tackle this requirement?
+## Domain Validation (Zod)
 
-You can use Graphql;
+- `accountExternalIdDebit/Credit`: **UUID v4**
+- `tranferTypeId`: enum **1 | 2 | 3**
+- `value`: **integer cents**, `1..1_000_000` (up to 10,000.00)
+- **Rule:** debit and credit accounts must be different
 
-# Send us your challenge
+**Idempotency:** Send `Idempotency-Key` header on `POST /transactions` to avoid duplicates (handled in repo).
 
-When you finish your challenge, after forking a repository, you **must** open a pull request to our repository. There are no limitations to the implementation, you can follow the programming paradigm, modularization, and style that you feel is the most appropriate solution.
+---
 
-If you have any questions, please let us know.
+## Local Tests (no Docker required)
+
+```bash
+# from repository root
+npm i --workspaces
+npm --workspace packages/shared run build
+
+npm --workspace services/transaction-service test
+npm --workspace services/anti-fraud-service test
+```
+
+What’s covered:
+- Endpoint creation & retrieval (Kafka mocked)
+- Domain validation & rules (UUID, integer cents, account mismatch)
+- Anti-fraud decision function (approve/reject boundary)
+
+---
+
+## Architecture
+
+**Clean/Hexagonal**
+- **domain/**: validation schemas & value objects
+- **application/**: `TransactionService` (use cases, orchestration, events)
+- **ports/**: `TransactionRepo`, `MessageBus`
+- **infra/**:
+  - `InMemoryTransactionRepo` (swappable later for DB)
+  - `KafkaBus` (KafkaJS)
+- **http/**: minimal controllers + RFC7807 error middleware
+- **di/**: tiny DI container to wire Repo + Bus → Service
+- **anti-fraud-service**: Kafka consumer with retries/backoff; publishes `transaction-status`
+
+**Event Flow**
+```
+POST /transactions  -> publish "transaction-created"
+anti-fraud-service  -> consume "transaction-created" -> decide -> publish "transaction-status"
+transaction-service -> consume "transaction-status" -> update state
+```
+
+---
+
+## Configuration
+
+Environment variables (validated):
+- `PORT` (default `3000`)
+- `KAFKA_BROKERS` (Compose uses `redpanda:9092`)
+- `NODE_ENV` (`production` disables pino-pretty transport)
+
+---
+
+## Troubleshooting
+
+- **Windows/PowerShell**: If ports are busy, try `docker compose down -v` and rerun.
+- If API returns `ECONNREFUSED`, confirm:
+  - `docker compose logs -f transaction-service`
+  - Hitting **`/api/v1/health`** at `http://localhost:3000`
+- If stuck in `"pending"`, check anti-fraud logs:
+  ```bash
+  docker compose logs -f anti-fraud-service
+  ```
+
+

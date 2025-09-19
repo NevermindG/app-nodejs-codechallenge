@@ -1,0 +1,13 @@
+{
+  "name": "yape-codechallenge",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run -ws build",
+    "dev:tx": "npm --workspace services/transaction-service run dev",
+    "dev:af": "npm --workspace services/anti-fraud-service run dev"
+  }
+}
